@@ -7,4 +7,5 @@ plotly
 matplotlib
 MetaTrader5
 torch
+joblib
 pytorch-lightning
