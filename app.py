@@ -1,13 +1,19 @@
 import streamlit as st
-import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
 import torch
 import joblib
 import plotly.graph_objects as go
 import xgboost as xgb
+import yfinance as yf
 
-st.set_page_config(layout="wide")
+# MT5 Cloud-la work aagaadhu, so try-except block
+try:
+    import MetaTrader5 as mt5
+except ImportError:
+    mt5 = None
+
+st.set_page_config(layout="wide", page_title="Hybrid Quant AI")
 
 # ================= LOGIN =================
 def login():
@@ -17,6 +23,7 @@ def login():
     if st.button("Login"):
         if user == "admin" and pwd == "admin123":
             st.session_state["auth"] = True
+            st.rerun()
         else:
             st.error("Invalid Credentials")
 
@@ -29,22 +36,9 @@ if not st.session_state["auth"]:
 
 # ================= SIDEBAR =================
 st.sidebar.title("Control Panel")
-
-mode = st.sidebar.selectbox(
-    "Mode",
-    ["Single Pair", "Compare 4 Pairs"]
-)
-
-pair = st.sidebar.selectbox(
-    "Currency Pair",
-    ["EURUSD","GBPUSD","USDJPY","XAUUSD"]
-)
-
-tf = st.sidebar.selectbox(
-    "Timeframe",
-    ["M1","H1","D1"]
-)
-
+mode = st.sidebar.selectbox("Mode", ["Single Pair", "Compare 4 Pairs"])
+pair = st.sidebar.selectbox("Currency Pair", ["EURUSD","GBPUSD","USDJPY","XAUUSD"])
+tf = st.sidebar.selectbox("Timeframe", ["M1","H1","D1"])
 st.sidebar.markdown("---")
 auto_refresh = st.sidebar.checkbox("Auto Refresh (60s)")
 
@@ -95,15 +89,54 @@ def build_features(df):
     df.dropna(inplace=True)
     return df
 
+# ================= HYBRID DATA FETCHING =================
+def get_hybrid_data(pair, tf):
+    # Timeframe mapping for MT5 and Yahoo Finance
+    tf_map_mt5 = {"M1": 1, "H1": 16385, "D1": 16408}
+    tf_map_yf = {"M1": "1m", "H1": "1h", "D1": "1d"}
+    
+    success = False
+    df = pd.DataFrame()
+
+    # Try MT5 (Works on Local PC)
+    if mt5 is not None:
+        if mt5.initialize():
+            rates = mt5.copy_rates_from_pos(pair, tf_map_mt5[tf], 0, 1000)
+            if rates is not None and len(rates) > 0:
+                df = pd.DataFrame(rates)
+                df['time'] = pd.to_datetime(df['time'], unit='s')
+                success = True
+            mt5.shutdown()
+
+    # If MT5 fails or not available, use Yahoo Finance (Works on Cloud)
+    if not success:
+        ticker = f"{pair}=X" if "USD" in pair else pair
+        if pair == "XAUUSD": ticker = "GC=F" # Gold ticker for YFinance
+        
+        # Fetch data
+        data = yf.download(ticker, period="5d", interval=tf_map_yf[tf])
+        if not data.empty:
+            df = data.reset_index()
+            # YFinance returns multi-index or different names, cleaning it:
+            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+            df.columns = [c.lower() for c in df.columns]
+            df.rename(columns={'datetime': 'time', 'date': 'time'}, inplace=True)
+            success = True
+            
+    return df, success
+
 # ================= PREDICTION =================
 def predict(pair, tf):
-    tf_map = {"M1": mt5.TIMEFRAME_M1, "H1": mt5.TIMEFRAME_H1, "D1": mt5.TIMEFRAME_D1}
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    rates = mt5.copy_rates_from_pos(pair, tf_map[tf], 0, 8000)
-    df = pd.DataFrame(rates)
-    df['time'] = pd.to_datetime(df['time'], unit='s')
-    df = build_features(df)
+    # Fetch Data
+    df_raw, success = get_hybrid_data(pair, tf)
+    
+    if not success or df_raw.empty:
+        st.error(f"Failed to fetch data for {pair}")
+        return None, None, None
+
+    df = build_features(df_raw.copy())
     X = df.drop(['time'], axis=1)
 
     path = f"models/{pair}/{tf}"
@@ -141,53 +174,52 @@ def predict(pair, tf):
 
 # ================= MAIN =================
 if st.button("Run AI Forecast"):
-
-    if not mt5.initialize():
-        st.error("MT5 Failed")
-        st.stop()
-
     pairs = ["EURUSD","GBPUSD","USDJPY","XAUUSD"] if mode=="Compare 4 Pairs" else [pair]
 
     for p in pairs:
-        df, current, predicted = predict(p, tf)
-        move = predicted
-        signal = "BUY" if move>0 else "SELL" if move<0 else "HOLD"
-        pct = move*100
+        with st.spinner(f"Analyzing {p}..."):
+            df, current, predicted = predict(p, tf)
+            
+        if df is not None:
+            move = predicted
+            signal = "BUY" if move > 0 else "SELL" if move < 0 else "HOLD"
+            pct = move * 100
 
-        st.markdown(f"## {p} - {tf}")
-        col1,col2 = st.columns([3,1])
+            st.markdown(f"## {p} - {tf}")
+            col1, col2 = st.columns([3, 1])
 
-        # --- Candlestick chart ---
-        with col1:
-            fig = go.Figure(data=[go.Candlestick(
-                x=df['time'].tail(100),
-                open=df['open'].tail(100),
-                high=df['high'].tail(100),
-                low=df['low'].tail(100),
-                close=df['close'].tail(100)
-            )])
-            fig.add_hline(y=current+predicted, line_dash="dash", line_color="yellow")
-            fig.update_layout(template="plotly_dark", height=500)
-            st.plotly_chart(fig,use_container_width=True)
+            # --- Candlestick chart ---
+            with col1:
+                fig = go.Figure(data=[go.Candlestick(
+                    x=df['time'].tail(100),
+                    open=df['open'].tail(100),
+                    high=df['high'].tail(100),
+                    low=df['low'].tail(100),
+                    close=df['close'].tail(100),
+                    name="Market Data"
+                )])
+                fig.add_hline(y=current + predicted, line_dash="dash", line_color="yellow", annotation_text="Target")
+                fig.update_layout(template="plotly_dark", height=500, margin=dict(l=20, r=20, t=20, b=20))
+                st.plotly_chart(fig, use_container_width=True)
 
-        # --- Signal display ---
-        with col2:
-            color = "green" if signal=="BUY" else "red" if signal=="SELL" else "gray"
-            st.markdown(
-                f"""
-                <div style="padding:20px;
-                            border-radius:10px;
-                            border:2px solid {color};
-                            text-align:center;">
-                    <h2>Current</h2>
-                    <h1>{round(current,5)}</h1>
-                    <h2>Predicted</h2>
-                    <h1 style="color:{color};">{round(current+predicted,5)}</h1>
-                    <h2 style="color:{color};">{signal}</h2>
-                    <p>Expected Move: {round(pct,3)}%</p>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-
-    mt5.shutdown()
+            # --- Signal display ---
+            with col2:
+                color = "green" if signal == "BUY" else "red" if signal == "SELL" else "gray"
+                st.markdown(
+                    f"""
+                    <div style="padding:20px;
+                                border-radius:10px;
+                                border:2px solid {color};
+                                text-align:center;
+                                background-color: rgba(0,0,0,0.2);">
+                        <h2 style="margin:0;">Current</h2>
+                        <h1 style="margin:0;">{round(current, 5)}</h1>
+                        <hr>
+                        <h2 style="margin:0;">Predicted</h2>
+                        <h1 style="color:{color}; margin:0;">{round(current + predicted, 5)}</h1>
+                        <h2 style="color:{color}; margin:0;">{signal}</h2>
+                        <p>Expected Move: {round(pct, 3)}%</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
