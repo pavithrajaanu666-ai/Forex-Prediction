@@ -5,7 +5,8 @@ xgboost
 scikit-learn
 plotly
 matplotlib
-MetaTrader5
+yfinance
 torch
 joblib
 pytorch-lightning
+
