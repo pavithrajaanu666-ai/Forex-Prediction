@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+xgboost
+scikit-learn
+plotly
+matplotlib
+MetaTrader5
+torch
+pytorch-lightning
