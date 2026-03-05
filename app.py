@@ -68,6 +68,7 @@ class DGN(torch.nn.Module):
 
 # ================= FEATURES =================
 def build_features(df):
+    # Model expects exact these features in order
     df['MA10'] = df['close'].rolling(10).mean()
     df['EMA20'] = df['close'].ewm(span=20).mean()
     df['Return'] = df['close'].pct_change()
@@ -89,16 +90,15 @@ def build_features(df):
     df.dropna(inplace=True)
     return df
 
-# ================= HYBRID DATA FETCHING =================
+# ================= HYBRID DATA FETCHING (FIXED) =================
 def get_hybrid_data(pair, tf):
-    # Timeframe mapping for MT5 and Yahoo Finance
     tf_map_mt5 = {"M1": 1, "H1": 16385, "D1": 16408}
     tf_map_yf = {"M1": "1m", "H1": "1h", "D1": "1d"}
     
     success = False
     df = pd.DataFrame()
 
-    # Try MT5 (Works on Local PC)
+    # 1. Try MT5 (Local)
     if mt5 is not None:
         if mt5.initialize():
             rates = mt5.copy_rates_from_pos(pair, tf_map_mt5[tf], 0, 1000)
@@ -108,19 +108,26 @@ def get_hybrid_data(pair, tf):
                 success = True
             mt5.shutdown()
 
-    # If MT5 fails or not available, use Yahoo Finance (Works on Cloud)
+    # 2. Fallback to YFinance (Cloud)
     if not success:
         ticker = f"{pair}=X" if "USD" in pair else pair
-        if pair == "XAUUSD": ticker = "GC=F" # Gold ticker for YFinance
+        if pair == "XAUUSD": ticker = "GC=F"
         
-        # Fetch data
         data = yf.download(ticker, period="5d", interval=tf_map_yf[tf])
         if not data.empty:
             df = data.reset_index()
-            # YFinance returns multi-index or different names, cleaning it:
+            # Clean columns names (fixes MultiIndex issue)
             df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
             df.columns = [c.lower() for c in df.columns]
             df.rename(columns={'datetime': 'time', 'date': 'time'}, inplace=True)
+            
+            # CRITICAL: Match MT5 column structure to fix ValueError
+            df['tick_volume'] = df.get('volume', 0)
+            df['spread'] = 0
+            df['real_volume'] = 0
+            
+            # Select only columns MT5 would provide
+            df = df[['time', 'open', 'high', 'low', 'close', 'tick_volume', 'spread', 'real_volume']]
             success = True
             
     return df, success
@@ -129,55 +136,59 @@ def get_hybrid_data(pair, tf):
 def predict(pair, tf):
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Fetch Data
     df_raw, success = get_hybrid_data(pair, tf)
     
     if not success or df_raw.empty:
-        st.error(f"Failed to fetch data for {pair}")
+        st.error(f"Data fetch failed for {pair}")
         return None, None, None
 
     df = build_features(df_raw.copy())
+    
+    # Drop time but KEEP other columns in training order
     X = df.drop(['time'], axis=1)
 
     path = f"models/{pair}/{tf}"
+    try:
+        # Load XGBoost
+        xgb_model = xgb.XGBRegressor()
+        xgb_model.load_model(f"{path}/xgb.json")
 
-    # --- Load XGBoost ---
-    xgb_model = xgb.XGBRegressor()
-    xgb_model.load_model(f"{path}/xgb.json")
+        # Load scalers
+        feature_scaler = joblib.load(f"{path}/feature_scaler.pkl")
+        target_scaler = joblib.load(f"{path}/target_scaler.pkl")
 
-    # --- Load scalers ---
-    feature_scaler = joblib.load(f"{path}/feature_scaler.pkl")
-    target_scaler = joblib.load(f"{path}/target_scaler.pkl")
+        # XGBoost prediction
+        X_scaled = feature_scaler.transform(X) # Fixed: X now matches scaler features
+        xgb_pred = xgb_model.predict(X_scaled[-1:])[0]
 
-    # --- XGBoost prediction ---
-    X_scaled = feature_scaler.transform(X)
-    xgb_pred = xgb_model.predict(X_scaled[-1:])[0]
+        # TFT prediction
+        seq = torch.tensor(X_scaled[-20:], dtype=torch.float32).unsqueeze(0).to(DEVICE)
+        tft = TFT(X.shape[1]).to(DEVICE)
+        tft.load_state_dict(torch.load(f"{path}/tft.pth", map_location=DEVICE))
+        tft.eval()
+        tft_scaled = tft(seq).detach().cpu().numpy()
+        tft_pred = target_scaler.inverse_transform(tft_scaled)[0][0]
 
-    # --- TFT prediction ---
-    seq = torch.tensor(X_scaled[-20:], dtype=torch.float32).unsqueeze(0).to(DEVICE)
-    tft = TFT(X.shape[1]).to(DEVICE)
-    tft.load_state_dict(torch.load(f"{path}/tft.pth", map_location=DEVICE))
-    tft.eval()
-    tft_scaled = tft(seq).detach().cpu().numpy()
-    tft_pred = target_scaler.inverse_transform(tft_scaled)[0][0]
+        # DGN stacking
+        dgn = DGN().to(DEVICE)
+        dgn.load_state_dict(torch.load(f"{path}/dgn.pth", map_location=DEVICE))
+        dgn.eval()
+        stack = torch.tensor([[xgb_pred, tft_pred]], dtype=torch.float32).to(DEVICE)
+        final_pred = dgn(stack).detach().cpu().numpy()[0][0]
 
-    # --- DGN stacking ---
-    dgn = DGN().to(DEVICE)
-    dgn.load_state_dict(torch.load(f"{path}/dgn.pth", map_location=DEVICE))
-    dgn.eval()
-    stack = torch.tensor([[xgb_pred, tft_pred]], dtype=torch.float32).to(DEVICE)
-    final_pred = dgn(stack).detach().cpu().numpy()[0][0]
+        current = df['close'].iloc[-1]
+        return df, current, final_pred
 
-    current = df['close'].iloc[-1]
-
-    return df, current, final_pred
+    except Exception as e:
+        st.error(f"Model error for {pair}: {e}")
+        return None, None, None
 
 # ================= MAIN =================
 if st.button("Run AI Forecast"):
     pairs = ["EURUSD","GBPUSD","USDJPY","XAUUSD"] if mode=="Compare 4 Pairs" else [pair]
 
     for p in pairs:
-        with st.spinner(f"Analyzing {p}..."):
+        with st.spinner(f"Predicting {p}..."):
             df, current, predicted = predict(p, tf)
             
         if df is not None:
@@ -185,41 +196,20 @@ if st.button("Run AI Forecast"):
             signal = "BUY" if move > 0 else "SELL" if move < 0 else "HOLD"
             pct = move * 100
 
-            st.markdown(f"## {p} - {tf}")
+            st.markdown(f"### {p} Result")
             col1, col2 = st.columns([3, 1])
 
-            # --- Candlestick chart ---
             with col1:
                 fig = go.Figure(data=[go.Candlestick(
-                    x=df['time'].tail(100),
-                    open=df['open'].tail(100),
-                    high=df['high'].tail(100),
-                    low=df['low'].tail(100),
-                    close=df['close'].tail(100),
-                    name="Market Data"
+                    x=df['time'].tail(50),
+                    open=df['open'].tail(50), high=df['high'].tail(50),
+                    low=df['low'].tail(50), close=df['close'].tail(50)
                 )])
-                fig.add_hline(y=current + predicted, line_dash="dash", line_color="yellow", annotation_text="Target")
-                fig.update_layout(template="plotly_dark", height=500, margin=dict(l=20, r=20, t=20, b=20))
+                fig.update_layout(template="plotly_dark", height=400)
                 st.plotly_chart(fig, use_container_width=True)
 
-            # --- Signal display ---
             with col2:
-                color = "green" if signal == "BUY" else "red" if signal == "SELL" else "gray"
-                st.markdown(
-                    f"""
-                    <div style="padding:20px;
-                                border-radius:10px;
-                                border:2px solid {color};
-                                text-align:center;
-                                background-color: rgba(0,0,0,0.2);">
-                        <h2 style="margin:0;">Current</h2>
-                        <h1 style="margin:0;">{round(current, 5)}</h1>
-                        <hr>
-                        <h2 style="margin:0;">Predicted</h2>
-                        <h1 style="color:{color}; margin:0;">{round(current + predicted, 5)}</h1>
-                        <h2 style="color:{color}; margin:0;">{signal}</h2>
-                        <p>Expected Move: {round(pct, 3)}%</p>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
+                color = "green" if signal == "BUY" else "red" if signal == "SELL" else "white"
+                st.metric("Current Price", round(current, 5))
+                st.metric("Predicted Move", f"{round(pct, 4)}%", delta=round(move, 5))
+                st.markdown(f"## Signal: :{color}[{signal}]")
